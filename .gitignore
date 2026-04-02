@@ -1,2 +1,12 @@
 IdemLedger_Spec.md
 THEORY.md
+
+# local env — never commit secrets
+.env
+
+# study journal — private, never committed
+phase_log/
+
+# compiled binaries
+idem-ledger
+bin/
