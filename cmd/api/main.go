@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/arnavprasad/idem-ledger/internal/config"
+	"github.com/arnavprasad/idem-ledger/internal/ledger"
 	"github.com/arnavprasad/idem-ledger/internal/store"
 )
 
@@ -73,6 +74,48 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, account)
+	})
+
+	mux.HandleFunc("POST /transfers", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			FromAccount int64  `json:"from_account"`
+			ToAccount   int64  `json:"to_account"`
+			Amount      int64  `json:"amount"`
+			Currency    string `json:"currency"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+		if req.Amount <= 0 {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "amount must be positive"})
+			return
+		}
+		if req.FromAccount == req.ToAccount {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "from_account and to_account must differ"})
+			return
+		}
+		if len(req.Currency) != 3 {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "currency must be a 3-letter ISO 4217 code"})
+			return
+		}
+		t, err := ledger.Execute(r.Context(), pool, ledger.TransferRequest{
+			FromAccount: req.FromAccount,
+			ToAccount:   req.ToAccount,
+			Amount:      req.Amount,
+			Currency:    strings.ToUpper(req.Currency),
+		})
+		switch {
+		case errors.Is(err, ledger.ErrInsufficientFunds):
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "insufficient funds"})
+		case errors.Is(err, ledger.ErrAccountNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
+		case err != nil:
+			log.Printf("execute transfer: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		default:
+			writeJSON(w, http.StatusCreated, t)
+		}
 	})
 
 	log.Printf("server listening on :%s", cfg.Port)
