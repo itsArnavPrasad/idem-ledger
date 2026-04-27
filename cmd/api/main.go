@@ -76,6 +76,32 @@ func main() {
 		writeJSON(w, http.StatusOK, account)
 	})
 
+	mux.HandleFunc("GET /accounts/{id}/history", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid account id"})
+			return
+		}
+		afterID := int64(0)
+		if s := r.URL.Query().Get("after"); s != "" {
+			afterID, err = strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid after cursor"})
+				return
+			}
+		}
+		postings, err := store.GetPostings(r.Context(), pool, id, afterID, 50)
+		if err != nil {
+			log.Printf("get postings: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+			return
+		}
+		if postings == nil {
+			postings = []store.Posting{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"postings": postings})
+	})
+
 	mux.HandleFunc("POST /transfers", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			FromAccount int64  `json:"from_account"`
