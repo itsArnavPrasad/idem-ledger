@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/arnavprasad/idem-ledger/internal/config"
+	"github.com/arnavprasad/idem-ledger/internal/idempotency"
 	"github.com/arnavprasad/idem-ledger/internal/ledger"
 	"github.com/arnavprasad/idem-ledger/internal/store"
 )
@@ -103,13 +104,23 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /transfers", func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, 0, 512)
+		buf := make([]byte, 512)
+		for {
+			n, err := r.Body.Read(buf)
+			body = append(body, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+
 		var req struct {
 			FromAccount int64  `json:"from_account"`
 			ToAccount   int64  `json:"to_account"`
 			Amount      int64  `json:"amount"`
 			Currency    string `json:"currency"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.Unmarshal(body, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
@@ -125,13 +136,25 @@ func main() {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "currency must be a 3-letter ISO 4217 code"})
 			return
 		}
-		t, err := ledger.Execute(r.Context(), pool, ledger.TransferRequest{
+
+		idemKey := r.Header.Get("Idempotency-Key")
+		lreq := ledger.TransferRequest{
 			FromAccount: req.FromAccount,
 			ToAccount:   req.ToAccount,
 			Amount:      req.Amount,
 			Currency:    strings.ToUpper(req.Currency),
-		})
+		}
+		if idemKey != "" {
+			lreq.IdempotencyKey = idemKey
+			lreq.RequestHash = idempotency.HashRequest(body)
+		}
+
+		t, stored, err := ledger.Execute(r.Context(), pool, lreq)
 		switch {
+		case errors.Is(err, idempotency.ErrDuplicateRequest):
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "idempotency key already used with a different request"})
+		case errors.Is(err, idempotency.ErrInProgress):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "request already in progress"})
 		case errors.Is(err, ledger.ErrInsufficientFunds):
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "insufficient funds"})
 		case errors.Is(err, ledger.ErrAccountNotFound):
@@ -139,6 +162,13 @@ func main() {
 		case err != nil:
 			log.Printf("execute transfer: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		case stored != nil:
+			// Replay: return exactly the response we stored the first time.
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Idempotent-Replayed", "true")
+			w.WriteHeader(stored.Code)
+			w.Write(stored.Body)
+			w.Write([]byte("\n"))
 		default:
 			writeJSON(w, http.StatusCreated, t)
 		}

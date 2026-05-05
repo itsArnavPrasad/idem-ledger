@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -9,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/arnavprasad/idem-ledger/internal/idempotency"
 )
 
 var (
@@ -21,7 +24,8 @@ type TransferRequest struct {
 	ToAccount      int64
 	Amount         int64
 	Currency       string
-	IdempotencyKey string // used in Phase 5+; if empty, a UUID is generated
+	IdempotencyKey string
+	RequestHash    string // SHA-256 of request body; required when IdempotencyKey is set
 }
 
 type Transfer struct {
@@ -35,24 +39,47 @@ type Transfer struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// Execute runs a transfer as a single atomic DB transaction using Fix A
-// (conditional atomic UPDATE). No idempotency check yet — that is Phase 5.
-func Execute(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, error) {
+// Execute runs a transfer as a single atomic DB transaction.
+// When IdempotencyKey is set, it claims the key, does the work, and records the
+// response — all inside one transaction. Replays return the stored response.
+func Execute(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotency.StoredResponse, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return Transfer{}, err
+		return Transfer{}, nil, err
 	}
-	defer tx.Rollback(ctx) // no-op if Commit succeeds
+	defer tx.Rollback(ctx)
+
+	// Idempotency check — runs inside the same transaction so the key claim
+	// and the transfer are atomic: the key is 'done' iff the transfer committed.
+	if req.IdempotencyKey != "" {
+		won, stored, err := idempotency.ClaimInTx(ctx, tx, req.IdempotencyKey, req.RequestHash)
+		if err != nil {
+			return Transfer{}, nil, err
+		}
+		if !won {
+			// Replay the stored response — the transaction was never needed.
+			tx.Rollback(ctx)
+			return Transfer{}, stored, nil
+		}
+	}
 
 	result, err := execTx(ctx, tx, req)
 	if err != nil {
-		return Transfer{}, err
+		return Transfer{}, nil, err
+	}
+
+	// Record the idempotent result before committing so it's atomic.
+	if req.IdempotencyKey != "" {
+		body, _ := json.Marshal(result)
+		if err := idempotency.Complete(ctx, tx, req.IdempotencyKey, 201, body); err != nil {
+			return Transfer{}, nil, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return Transfer{}, err
+		return Transfer{}, nil, err
 	}
-	return result, nil
+	return result, nil, nil
 }
 
 // execTx performs the core transfer logic inside an already-open transaction.
