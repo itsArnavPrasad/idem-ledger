@@ -82,35 +82,19 @@ func Execute(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Tran
 	return result, nil, nil
 }
 
-// execTx performs the core transfer logic inside an already-open transaction.
-// Exported separately so Phase 5 (idempotency) can wrap it.
+// execTx runs the transfer inside tx using the default Fix A debit strategy.
 func execTx(ctx context.Context, tx pgx.Tx, req TransferRequest) (Transfer, error) {
-	// Fix A: conditional atomic UPDATE — safe under READ COMMITTED.
-	// The UPDATE takes a row lock and re-evaluates balance >= amount at lock time,
-	// so there is no read-write gap for another transaction to sneak through.
-	tag, err := tx.Exec(ctx,
-		`UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1`,
-		req.Amount, req.FromAccount,
-	)
-	if err != nil {
+	return execTxWithDebit(ctx, tx, req, debitConditionalUpdate)
+}
+
+// execTxWithDebit runs the transfer using the provided debit strategy.
+// Called by Fix A (execTx), Fix B (ExecuteWithForUpdate), and Fix C (ExecuteOptimistic).
+func execTxWithDebit(ctx context.Context, tx pgx.Tx, req TransferRequest, debit debitFn) (Transfer, error) {
+	if err := debit(ctx, tx, req.FromAccount, req.Amount); err != nil {
 		return Transfer{}, err
 	}
-	if tag.RowsAffected() == 0 {
-		// Could be: account missing, or funds too low. Distinguish with a quick SELECT.
-		var exists bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)`, req.FromAccount,
-		).Scan(&exists); err != nil {
-			return Transfer{}, err
-		}
-		if !exists {
-			return Transfer{}, ErrAccountNotFound
-		}
-		return Transfer{}, ErrInsufficientFunds
-	}
 
-	// Credit destination. A missing to_account produces 0 rows here and then a
-	// FK violation on the transfers INSERT below, which we map to ErrAccountNotFound.
+	// Credit destination.
 	if _, err := tx.Exec(ctx,
 		`UPDATE accounts SET balance = balance + $1 WHERE id = $2`,
 		req.Amount, req.ToAccount,
@@ -118,6 +102,11 @@ func execTx(ctx context.Context, tx pgx.Tx, req TransferRequest) (Transfer, erro
 		return Transfer{}, err
 	}
 
+	return insertTransferAndPostings(ctx, tx, req)
+}
+
+// insertTransferAndPostings writes the transfers row and the two balanced postings.
+func insertTransferAndPostings(ctx context.Context, tx pgx.Tx, req TransferRequest) (Transfer, error) {
 	idempotencyKey := req.IdempotencyKey
 	if idempotencyKey == "" {
 		idempotencyKey = uuid.New().String()
@@ -125,7 +114,7 @@ func execTx(ctx context.Context, tx pgx.Tx, req TransferRequest) (Transfer, erro
 	transferID := uuid.New()
 
 	var t Transfer
-	err = tx.QueryRow(ctx,
+	err := tx.QueryRow(ctx,
 		`INSERT INTO transfers (id, idempotency_key, status, amount, currency, from_account, to_account)
 		 VALUES ($1, $2, 'posted', $3, $4, $5, $6)
 		 RETURNING id, idempotency_key, status, amount, currency, from_account, to_account, created_at`,
@@ -133,7 +122,7 @@ func execTx(ctx context.Context, tx pgx.Tx, req TransferRequest) (Transfer, erro
 	).Scan(&t.ID, &t.IdempotencyKey, &t.Status, &t.Amount, &t.Currency, &t.FromAccount, &t.ToAccount, &t.CreatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // FK violation
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			return Transfer{}, ErrAccountNotFound
 		}
 		return Transfer{}, err
@@ -146,6 +135,5 @@ func execTx(ctx context.Context, tx pgx.Tx, req TransferRequest) (Transfer, erro
 	); err != nil {
 		return Transfer{}, err
 	}
-
 	return t, nil
 }
