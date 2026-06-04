@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/arnavprasad/idem-ledger/internal/ledger"
 	"github.com/arnavprasad/idem-ledger/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -43,11 +44,13 @@ func main() {
 	// Run transfers
 	fmt.Printf("Running %d transfers (%d workers, strategy=%s)...\n", *nTransfers, *nWorkers, *strategy)
 	start := time.Now()
-	violations, durations := runTransfers(ctx, pool, accountIDs, *nTransfers, *nWorkers, *strategy)
+	violations, hist := runTransfers(ctx, pool, accountIDs, *nTransfers, *nWorkers, *strategy)
 	elapsed := time.Since(start)
 
 	tps := float64(*nTransfers) / elapsed.Seconds()
-	p50, p99 := percentiles(durations)
+	// hdrhistogram stores values in microseconds; convert back to Duration for display.
+	p50 := time.Duration(hist.ValueAtQuantile(50)) * time.Microsecond
+	p99 := time.Duration(hist.ValueAtQuantile(99)) * time.Microsecond
 
 	fmt.Printf("\n=== Results ===\n")
 	fmt.Printf("Strategy:            %s\n", *strategy)
@@ -85,25 +88,34 @@ func seedAccounts(ctx context.Context, pool *pgxpool.Pool, n int) []int64 {
 	return ids
 }
 
-func runTransfers(ctx context.Context, pool *pgxpool.Pool, ids []int64, total, workers int, strategy string) (int64, []time.Duration) {
+// runTransfers fires total transfers across workers goroutines using the given strategy.
+// Returns the error count and an HdrHistogram of per-transfer latencies in microseconds.
+// HdrHistogram range: 1µs to 30s (covers everything from fast commits to lock timeouts).
+func runTransfers(ctx context.Context, pool *pgxpool.Pool, ids []int64, total, workers int, strategy string) (int64, *hdrhistogram.Histogram) {
 	jobs := make(chan struct{}, total)
 	for i := 0; i < total; i++ {
 		jobs <- struct{}{}
 	}
 	close(jobs)
 
+	// One histogram per worker; merge at the end to avoid per-record mutex contention.
+	workerHists := make([]*hdrhistogram.Histogram, workers)
+	for i := range workerHists {
+		workerHists[i] = hdrhistogram.New(1, 30_000_000, 3) // 1µs – 30s, 3 sig figs
+	}
+
 	var (
-		mu        sync.Mutex
-		durations []time.Duration
-		errors    atomic.Int64
-		wg        sync.WaitGroup
+		errors atomic.Int64
+		wg     sync.WaitGroup
 	)
 
 	for w := 0; w < workers; w++ {
+		w := w
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(rand.Int63()))
+			hist := workerHists[w]
 			for range jobs {
 				from := ids[rng.Intn(len(ids))]
 				to := ids[rng.Intn(len(ids))]
@@ -128,20 +140,24 @@ func runTransfers(ctx context.Context, pool *pgxpool.Pool, ids []int64, total, w
 				default:
 					_, _, err = ledger.Execute(ctx, pool, req)
 				}
-				dur := time.Since(t0)
+				micros := time.Since(t0).Microseconds()
 
 				if err != nil && err != ledger.ErrInsufficientFunds {
 					errors.Add(1)
 					log.Printf("transfer error: %v", err)
 				}
-				mu.Lock()
-				durations = append(durations, dur)
-				mu.Unlock()
+				hist.RecordValue(micros)
 			}
 		}()
 	}
 	wg.Wait()
-	return errors.Load(), durations
+
+	// Merge all per-worker histograms into one.
+	merged := hdrhistogram.New(1, 30_000_000, 3)
+	for _, h := range workerHists {
+		merged.Merge(h)
+	}
+	return errors.Load(), merged
 }
 
 func checkInvariants(ctx context.Context, pool *pgxpool.Pool, ids []int64, n int) {
@@ -196,19 +212,3 @@ func checkInvariants(ctx context.Context, pool *pgxpool.Pool, ids []int64, n int
 	}
 }
 
-func percentiles(d []time.Duration) (p50, p99 time.Duration) {
-	if len(d) == 0 {
-		return 0, 0
-	}
-	// Simple sort-based percentile (accurate enough for reporting)
-	n := len(d)
-	sorted := make([]time.Duration, n)
-	copy(sorted, d)
-	// insertion sort — fast enough for ~50k items
-	for i := 1; i < n; i++ {
-		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
-	return sorted[n/2], sorted[int(float64(n)*0.99)]
-}
