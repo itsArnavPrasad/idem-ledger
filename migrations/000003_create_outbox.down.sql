@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS outbox;
+ALTER TABLE accounts DROP COLUMN IF EXISTS webhook_url;

@@ -80,3 +80,26 @@ func GetAccount(ctx context.Context, db *pgxpool.Pool, id int64) (Account, error
 	}
 	return a, err
 }
+
+// SetWebhookURL updates the webhook_url for an account.
+func SetWebhookURL(ctx context.Context, db *pgxpool.Pool, accountID int64, url string) error {
+	_, err := db.Exec(ctx,
+		`UPDATE accounts SET webhook_url = $1 WHERE id = $2`,
+		url, accountID,
+	)
+	return err
+}
+
+// GetWebhookURLInTx reads the webhook_url for an account inside an existing transaction.
+// Returns nil if the account has no webhook configured.
+func GetWebhookURLInTx(ctx context.Context, tx pgx.Tx, accountID int64) (*string, error) {
+	var url *string
+	err := tx.QueryRow(ctx,
+		`SELECT webhook_url FROM accounts WHERE id = $1`,
+		accountID,
+	).Scan(&url)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return url, err
+}

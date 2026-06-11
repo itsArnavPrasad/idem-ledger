@@ -12,6 +12,7 @@ import (
 	"github.com/arnavprasad/idem-ledger/internal/config"
 	"github.com/arnavprasad/idem-ledger/internal/idempotency"
 	"github.com/arnavprasad/idem-ledger/internal/ledger"
+	"github.com/arnavprasad/idem-ledger/internal/outbox"
 	"github.com/arnavprasad/idem-ledger/internal/store"
 )
 
@@ -24,6 +25,12 @@ func main() {
 	}
 	defer pool.Close()
 
+	// Start the outbox poller in the background. It delivers events to merchant
+	// webhooks at-least-once; the poller goroutine lives for the server's lifetime.
+	pollerCtx, cancelPoller := context.WithCancel(context.Background())
+	defer cancelPoller()
+	go outbox.New(pool).Run(pollerCtx)
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -32,8 +39,9 @@ func main() {
 
 	mux.HandleFunc("POST /accounts", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Name     string `json:"name"`
-			Currency string `json:"currency"`
+			Name       string `json:"name"`
+			Currency   string `json:"currency"`
+			WebhookURL string `json:"webhook_url"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -54,6 +62,11 @@ func main() {
 			log.Printf("create account: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 			return
+		}
+		if req.WebhookURL != "" {
+			if err := store.SetWebhookURL(r.Context(), pool, account.ID, req.WebhookURL); err != nil {
+				log.Printf("set webhook url: %v", err)
+			}
 		}
 		writeJSON(w, http.StatusCreated, account)
 	})

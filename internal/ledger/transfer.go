@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/arnavprasad/idem-ledger/internal/idempotency"
+	"github.com/arnavprasad/idem-ledger/internal/store"
 )
 
 var (
@@ -135,5 +136,18 @@ func insertTransferAndPostings(ctx context.Context, tx pgx.Tx, req TransferReque
 	); err != nil {
 		return Transfer{}, err
 	}
+
+	// Write outbox event in the same transaction so the event is atomic with the
+	// transfer: exists iff the transfer committed, never lost on a crash between
+	// COMMIT and the old naive "fire webhook after commit" approach.
+	webhookURL, err := store.GetWebhookURLInTx(ctx, tx, req.ToAccount)
+	if err != nil {
+		return Transfer{}, err
+	}
+	payload, _ := json.Marshal(t)
+	if err := store.InsertOutboxEventInTx(ctx, tx, "transfer.created", payload, webhookURL); err != nil {
+		return Transfer{}, err
+	}
+
 	return t, nil
 }
