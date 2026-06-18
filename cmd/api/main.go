@@ -187,6 +187,16 @@ func main() {
 		}
 	})
 
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		m, err := store.GetOutboxMetrics(r.Context(), pool)
+		if err != nil {
+			log.Printf("get metrics: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"outbox": m})
+	})
+
 	log.Printf("server listening on :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatal(err)

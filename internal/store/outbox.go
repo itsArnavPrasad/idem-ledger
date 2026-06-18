@@ -73,6 +73,42 @@ func MarkDelivered(ctx context.Context, db *pgxpool.Pool, id uuid.UUID) error {
 	return err
 }
 
+// OutboxMetrics summarises outbox health for the /metrics endpoint.
+type OutboxMetrics struct {
+	Pending    int `json:"pending"`
+	InFlight   int `json:"in_flight"`
+	Delivered  int `json:"delivered"`
+	DeadLetter int `json:"dead_letter"`
+}
+
+// GetOutboxMetrics returns current row counts per status.
+func GetOutboxMetrics(ctx context.Context, db *pgxpool.Pool) (OutboxMetrics, error) {
+	rows, err := db.Query(ctx, `SELECT status, COUNT(*) FROM outbox GROUP BY status`)
+	if err != nil {
+		return OutboxMetrics{}, err
+	}
+	defer rows.Close()
+	var m OutboxMetrics
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return OutboxMetrics{}, err
+		}
+		switch status {
+		case "pending":
+			m.Pending = n
+		case "in_flight":
+			m.InFlight = n
+		case "delivered":
+			m.Delivered = n
+		case "dead_letter":
+			m.DeadLetter = n
+		}
+	}
+	return m, rows.Err()
+}
+
 // MarkFailed increments attempt_count and either schedules a retry (pending) or
 // dead-letters the event after maxRetries total attempts.
 // Backoff: 5s * 2^attempt_count + up to 5s random jitter, so:
