@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: idem
+          POSTGRES_PASSWORD: idem
+          POSTGRES_DB: idemledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://idem:idem@localhost:5432/idemledger?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install migrate
+        run: go install github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+
+      - name: Run migrations
+        run: migrate -path ./migrations -database "$DATABASE_URL" up
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Smoke loadtest (1000 transfers, correctness proof)
+        run: |
+          go run ./cmd/loadtest \
+            -accounts 50 \
+            -transfers 1000 \
+            -workers 10 \
+            -strategy conditional_update \
+          | tee /tmp/loadtest.out
+          grep -q "Invariant violations: 0" /tmp/loadtest.out
+
+      - name: Reconciliation check
+        run: go run ./cmd/recon
