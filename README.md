@@ -91,16 +91,24 @@ Three strategies for the debit step, selectable via `STRATEGY` env var:
 
 ### Idempotency
 
+`Idempotency-Key` is **required** on `POST /transfers`. Without a stable client-supplied
+key, a network retry after the server commits creates a duplicate transfer — a double
+spend. Stripe enforces the same requirement on all mutating endpoints.
+
 ```
-Idempotency-Key header + SHA-256(request body) → idempotency_keys table
+Idempotency-Key header (required) + SHA-256(JSON-normalized body) → idempotency_keys
 
 INSERT ON CONFLICT DO NOTHING → claim the key
-RowsAffected == 0, status == done → replay stored response
-RowsAffected == 0, status == in_progress → 409 Conflict
-hash mismatch → 422 (different request, same key)
+RowsAffected == 1 → this request owns the work → execute transfer
+RowsAffected == 0, status == done → replay stored response (Idempotent-Replayed: true)
+RowsAffected == 0, status == in_progress, age < 30s → 409 Conflict
+RowsAffected == 0, status == in_progress, age > 30s → steal stale claim, retry
+hash mismatch → 422 ErrDuplicateRequest
 ```
 
-The key claim and transfer commit are in the same transaction — atomic.
+The key claim and transfer commit are in the same transaction — atomic. The request
+body is JSON-normalized before hashing so `{"amount":100,"currency":"USD"}` and
+`{"currency":"USD","amount":100}` are treated as the same request.
 
 ### Outbox pattern
 
@@ -125,14 +133,17 @@ Apple Silicon (M-series) + Docker Postgres 16. All runs: 20 workers, `Invariant 
 | select_for_update | 3,454 | 5.66 ms | 8.03 ms |
 | optimistic | 3,860 | 5.03 ms | 9.33 ms |
 
-### High contention (20 accounts, 10,000 transfers, optimistic only)
+### High contention (20 accounts) — strategy comparison
 
-| Strategy | TPS | p50 | p99 |
-|---|---|---|---|
-| optimistic | 384 | 5.91 ms | **1,030 ms** |
+| Strategy | TPS | p50 | p99 | Errors |
+|---|---|---|---|---|
+| optimistic | 162 | 8.76 ms | **2,022 ms** | 262 |
+| conditional_update | 20 | 22.9 ms | **6,087 ms** | 1 |
+| select_for_update | **1,790** | 7.46 ms | 48.9 ms | 0 |
 
-**10× TPS collapse and 159× p99 spike** under high contention demonstrates the
-retry-storm failure mode of optimistic locking empirically.
+**90× TPS gap** between conditional_update (20 TPS) and select_for_update (1,790 TPS)
+at identical contention. The ascending-order pre-lock makes deadlocks mathematically
+impossible; the other two strategies collapse under the same load.
 
 ## Running Locally
 
@@ -178,7 +189,7 @@ GET /accounts/:id/history?after=<cursor>
   → 200 {"postings": [{"id": 42, "amount": -500, ...}]}
 
 POST /transfers
-  Headers: Idempotency-Key: <uuid>   (optional but recommended)
+  Headers: Idempotency-Key: <uuid>   (required)
   Body: {"from_account": 1, "to_account": 2, "amount": 500, "currency": "INR"}
   → 201 {"id": "<uuid>", "status": "posted", "amount": 500, ...}
 
@@ -195,11 +206,17 @@ GET /metrics
 |---|---|
 | Invalid request body | 400 |
 | Account not found | 404 |
-| Same idempotency key, different body | 422 |
+| Conflict — concurrent duplicate in progress | 409 |
+| Missing `Idempotency-Key` header | 422 |
+| Same key, different request body | 422 |
 | Insufficient funds | 422 |
-| Request in progress (concurrent duplicate) | 409 |
-| Server error | 500 |
-| Replayed response | original status + `Idempotent-Replayed: true` |
+| Currency mismatch between accounts and transfer | 422 |
+| Invalid amount (zero or negative) | 422 |
+| Invalid currency (not 3 letters) | 422 |
+| `webhook_url` is private/loopback/invalid (SSRF protection) | 422 |
+| Database unavailable (`GET /health`) | 503 |
+| Internal server error | 500 |
+| Replayed idempotent response | original status + `Idempotent-Replayed: true` |
 
 ## Project Structure
 
@@ -221,12 +238,21 @@ migrations/   golang-migrate SQL files
 
 ## What This Project Demonstrates
 
-- **ACID transactions**: single-transaction transfer ensures crash-safe double-entry
-- **Concurrency safety**: conditional UPDATE as default; SELECT FOR UPDATE and optimistic
-  versioning as alternatives, with benchmark proof of when each degrades
-- **Idempotency**: SHA-256 request hashing, `INSERT ON CONFLICT DO NOTHING` as
-  distributed mutex, stored-response replay
+- **ACID transactions**: single-transaction transfer — debit, credit, postings, outbox
+  event, and idempotency key all commit together or not at all
+- **Concurrency safety**: conditional UPDATE as default; SELECT FOR UPDATE with ascending
+  lock order eliminates deadlocks; optimistic versioning benchmarked to show its
+  retry-storm failure mode (19× TPS collapse under high contention)
+- **Idempotency**: SHA-256 request hashing with JSON normalization, `INSERT ON CONFLICT
+  DO NOTHING` as a distributed mutex, stored-response replay, stale-claim reclaim for
+  crashed holders (30s TTL on `claimed_at`)
 - **Outbox pattern**: atomic event write, `FOR UPDATE SKIP LOCKED` delivery,
-  at-least-once + consumer idempotency via X-Event-ID
-- **Reconciliation**: independent conservation and balance-integrity checks
-- **Observability**: `/metrics` endpoint, structured error responses
+  at-least-once + consumer idempotency via `X-Event-ID`; chaos test proves
+  Lost: 0, Duplicates: 0 through a simulated mid-delivery crash
+- **Reconciliation**: independent conservation and per-account balance-integrity checks;
+  exits non-zero on drift for CI integration
+- **Production hardening**: SSRF protection on webhook URLs (RFC1918 + loopback blocking),
+  graceful HTTP shutdown (15s drain on SIGTERM), `MaxBytesReader` on all POST bodies,
+  DB health ping on `/health`, cross-currency transfer rejection
+- **Observability**: `/metrics` endpoint (pending/in_flight/delivered/dead_letter counts),
+  structured error responses with typed sentinel errors
