@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -57,16 +58,15 @@ func main() {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "currency must be a 3-letter ISO 4217 code"})
 			return
 		}
-		account, err := store.CreateAccount(r.Context(), pool, req.Name, req.Currency)
+		var webhookURL *string
+		if req.WebhookURL != "" {
+			webhookURL = &req.WebhookURL
+		}
+		account, err := store.CreateAccount(r.Context(), pool, req.Name, req.Currency, webhookURL)
 		if err != nil {
 			log.Printf("create account: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 			return
-		}
-		if req.WebhookURL != "" {
-			if err := store.SetWebhookURL(r.Context(), pool, account.ID, req.WebhookURL); err != nil {
-				log.Printf("set webhook url: %v", err)
-			}
 		}
 		writeJSON(w, http.StatusCreated, account)
 	})
@@ -117,14 +117,10 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /transfers", func(w http.ResponseWriter, r *http.Request) {
-		body := make([]byte, 0, 512)
-		buf := make([]byte, 512)
-		for {
-			n, err := r.Body.Read(buf)
-			body = append(body, buf[:n]...)
-			if err != nil {
-				break
-			}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read request body"})
+			return
 		}
 
 		var req struct {

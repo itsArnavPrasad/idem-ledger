@@ -67,6 +67,9 @@ func debitSelectForUpdate(ctx context.Context, tx pgx.Tx, fromAccount, amount in
 // Both account rows are locked in ascending ID order before any balance is read,
 // preventing deadlocks when concurrent transfers run in opposite directions (A→B and B→A).
 func ExecuteWithForUpdate(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotencyResult, error) {
+	if req.IdempotencyKey != "" {
+		return Transfer{}, nil, errors.New("idempotency key not supported by ExecuteWithForUpdate; use Execute")
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return Transfer{}, nil, err
@@ -102,6 +105,9 @@ func ExecuteWithForUpdate(ctx context.Context, pool *pgxpool.Pool, req TransferR
 const maxOptimisticRetries = 5
 
 func ExecuteOptimistic(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotencyResult, error) {
+	if req.IdempotencyKey != "" {
+		return Transfer{}, nil, errors.New("idempotency key not supported by ExecuteOptimistic; use Execute")
+	}
 	for attempt := 0; attempt < maxOptimisticRetries; attempt++ {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
@@ -156,7 +162,10 @@ func ExecuteOptimistic(ctx context.Context, pool *pgxpool.Pool, req TransferRequ
 			return Transfer{}, nil, err
 		}
 		if err := tx.Commit(ctx); err != nil {
-			// Could be a serialisation conflict — retry.
+			// Commit failed (serialisation conflict or transient error) — roll back and retry.
+			// Without this Rollback the pgx connection is returned to the pool in an aborted
+			// transaction state, causing "current transaction is aborted" errors for unrelated callers.
+			tx.Rollback(ctx)
 			continue
 		}
 		return result, nil, nil

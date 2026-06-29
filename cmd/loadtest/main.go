@@ -72,7 +72,7 @@ func seedAccounts(ctx context.Context, pool *pgxpool.Pool, n int) []int64 {
 	ids := make([]int64, 0, n)
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("load-acct-%d", i)
-		acc, err := store.CreateAccount(ctx, pool, name, "INR")
+		acc, err := store.CreateAccount(ctx, pool, name, "INR", nil)
 		if err != nil {
 			log.Fatalf("create account: %v", err)
 		}
@@ -146,7 +146,12 @@ func runTransfers(ctx context.Context, pool *pgxpool.Pool, ids []int64, total, w
 					errors.Add(1)
 					log.Printf("transfer error: %v", err)
 				}
-				hist.RecordValue(micros)
+				if recErr := hist.RecordValue(micros); recErr != nil {
+					// Value exceeds histogram max (30s). Clamp to max so the sample
+					// is still counted rather than silently dropped. A clamped value
+					// keeps the count accurate and skews p99 toward the true value.
+					hist.RecordValue(hist.HighestTrackableValue())
+				}
 			}
 		}()
 	}

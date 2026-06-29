@@ -96,11 +96,15 @@ func execTxWithDebit(ctx context.Context, tx pgx.Tx, req TransferRequest, debit 
 	}
 
 	// Credit destination.
-	if _, err := tx.Exec(ctx,
+	creditTag, err := tx.Exec(ctx,
 		`UPDATE accounts SET balance = balance + $1 WHERE id = $2`,
 		req.Amount, req.ToAccount,
-	); err != nil {
+	)
+	if err != nil {
 		return Transfer{}, err
+	}
+	if creditTag.RowsAffected() == 0 {
+		return Transfer{}, ErrAccountNotFound
 	}
 
 	return insertTransferAndPostings(ctx, tx, req)

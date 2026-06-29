@@ -42,7 +42,7 @@ func Claim(ctx context.Context, db *pgxpool.Pool, key, requestHash string) (won 
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO idempotency_keys (key, request_hash, status)
 		 VALUES ($1, $2, 'in_progress')
 		 ON CONFLICT (key) DO NOTHING`,
@@ -52,7 +52,15 @@ func Claim(ctx context.Context, db *pgxpool.Pool, key, requestHash string) (won 
 		return false, nil, err
 	}
 
-	// Read back what exists for this key (either what we just inserted, or the pre-existing row).
+	if tag.RowsAffected() == 1 {
+		// We inserted the row — we won the race. Commit the insertion and proceed.
+		if err := tx.Commit(ctx); err != nil {
+			return false, nil, err
+		}
+		return true, nil, nil
+	}
+
+	// Row already existed. Read it to determine what to do.
 	var existingHash, status string
 	var respCode *int
 	var respBody []byte
@@ -66,31 +74,18 @@ func Claim(ctx context.Context, db *pgxpool.Pool, key, requestHash string) (won 
 
 	if existingHash != requestHash {
 		// Same key, different body — client is misusing the key.
-		tx.Rollback(ctx)
 		return false, nil, ErrDuplicateRequest
 	}
 
-	if status == "in_progress" && respCode == nil {
-		// We either just inserted it (we won) or someone else has it in-progress (we lost).
-		// Distinguish: if the row was inserted by us this round, we won.
-		// We detect this by checking if RowsAffected on the INSERT above was 1. But we already
-		// executed the INSERT and discarded the tag. Re-detect: try to claim by updating status
-		// only if status is still in_progress and response_code is null — only the owner proceeds.
-		// Simpler: we always win the INSERT or we read an existing row. Use a lock.
-		// Since we used ON CONFLICT DO NOTHING, if we got 0 rows it already existed.
-		// Check if the row we read has a null response_code (means work not done = in_progress).
-		// The caller (Phase 6) handles the ErrInProgress case.
-		_ = tx.Commit(ctx)
-		return true, nil, nil // tentatively won; Phase 6 makes this robust
+	if status == "in_progress" {
+		return false, nil, ErrInProgress
 	}
 
-	if status == "done" {
-		_ = tx.Commit(ctx)
-		return false, &StoredResponse{Code: *respCode, Body: json.RawMessage(respBody)}, nil
+	// status == "done" — replay the stored response.
+	if err := tx.Commit(ctx); err != nil {
+		return false, nil, err
 	}
-
-	_ = tx.Commit(ctx)
-	return true, nil, nil
+	return false, &StoredResponse{Code: *respCode, Body: json.RawMessage(respBody)}, nil
 }
 
 // Complete marks the key as done and stores the response, inside a provided transaction.

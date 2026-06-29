@@ -59,12 +59,17 @@ type Account struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func CreateAccount(ctx context.Context, db *pgxpool.Pool, name, currency string) (Account, error) {
+// CreateAccount inserts a new account. webhookURL may be nil for accounts with no webhook.
+// Setting webhook_url in the same INSERT as the account creation is intentional: it avoids
+// a race where a transfer fires before SetWebhookURL runs and the outbox event gets a NULL
+// target_url (permanent no-op delivery). Atomicity also prevents a partial state where the
+// account exists but the webhook isn't set.
+func CreateAccount(ctx context.Context, db *pgxpool.Pool, name, currency string, webhookURL *string) (Account, error) {
 	var a Account
 	err := db.QueryRow(ctx,
-		`INSERT INTO accounts (name, currency) VALUES ($1, $2)
+		`INSERT INTO accounts (name, currency, webhook_url) VALUES ($1, $2, $3)
 		 RETURNING id, name, currency, balance, created_at`,
-		name, currency,
+		name, currency, webhookURL,
 	).Scan(&a.ID, &a.Name, &a.Currency, &a.Balance, &a.CreatedAt)
 	return a, err
 }

@@ -15,10 +15,14 @@ import (
 )
 
 const (
-	pollInterval = 100 * time.Millisecond
-	batchSize    = 50
-	maxRetries   = 8
+	pollInterval   = 100 * time.Millisecond
+	batchSize      = 50
+	maxRetries     = 8
 	deliverTimeout = 10 * time.Second
+	// markTimeout is the budget for post-delivery DB writes.
+	// It intentionally uses context.Background() so it survives poller shutdown;
+	// the transfer is already delivered and the DB state must reflect that.
+	markTimeout = 5 * time.Second
 )
 
 // Poller delivers outbox events via HTTP. Run it as a goroutine; cancel the ctx
@@ -62,11 +66,23 @@ func (p *Poller) poll(ctx context.Context) error {
 	return nil
 }
 
+// markCtx returns a context for DB state-update calls after delivery.
+// It uses context.Background() — not the poller's ctx — so that marking
+// succeeds even when the poller is shutting down. Without this, a shutdown
+// signal between HTTP success and MarkDelivered leaves the row in_flight
+// permanently (until the stale-recovery mechanism reclaims it, causing a
+// duplicate delivery to the merchant).
+func markCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), markTimeout)
+}
+
 func (p *Poller) deliver(ctx context.Context, e store.OutboxEvent) {
 	// No webhook configured — treat as delivered immediately.
 	if e.TargetURL == nil || *e.TargetURL == "" {
-		if err := store.MarkDelivered(ctx, p.db, e.ID); err != nil {
-			log.Printf("outbox mark delivered (no-op): %v", err)
+		mCtx, cancel := markCtx()
+		defer cancel()
+		if err := store.MarkDelivered(mCtx, p.db, e.ID); err != nil {
+			log.Printf("outbox mark delivered (no-op) id=%s: %v", e.ID, err)
 		}
 		return
 	}
@@ -74,7 +90,12 @@ func (p *Poller) deliver(ctx context.Context, e store.OutboxEvent) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, *e.TargetURL,
 		strings.NewReader(string(e.Payload)))
 	if err != nil {
-		store.MarkFailed(ctx, p.db, e.ID, err.Error(), maxRetries)
+		// Malformed URL stored in target_url — permanent failure, dead-letter immediately.
+		mCtx, cancel := markCtx()
+		defer cancel()
+		if err2 := store.MarkDeadLetter(mCtx, p.db, e.ID, "bad target_url: "+err.Error()); err2 != nil {
+			log.Printf("outbox dead-letter (bad url) id=%s: %v", e.ID, err2)
+		}
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -84,21 +105,35 @@ func (p *Poller) deliver(ctx context.Context, e store.OutboxEvent) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		store.MarkFailed(ctx, p.db, e.ID, err.Error(), maxRetries)
+		// Network/timeout error — schedule retry with backoff.
+		mCtx, cancel := markCtx()
+		defer cancel()
+		if err2 := store.MarkFailed(mCtx, p.db, e.ID, err.Error(), maxRetries); err2 != nil {
+			log.Printf("outbox mark failed (network err) id=%s: %v", e.ID, err2)
+		}
 		return
 	}
 	resp.Body.Close()
 
+	mCtx, cancel := markCtx()
+	defer cancel()
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		store.MarkDelivered(ctx, p.db, e.ID)
+		if err := store.MarkDelivered(mCtx, p.db, e.ID); err != nil {
+			log.Printf("outbox mark delivered id=%s: %v", e.ID, err)
+		}
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		// Client error — dead-letter immediately (retrying won't help).
-		store.MarkFailed(ctx, p.db, e.ID,
-			http.StatusText(resp.StatusCode), maxRetries+1) // maxRetries+1 forces dead_letter
+		// Client error (404, 410, etc.) — retrying cannot help, dead-letter immediately.
+		// Bug fix: the old code used MarkFailed(maxRetries+1) which evaluated
+		// attempt_count+1 >= maxRetries+1 = false for a fresh event, so it retried
+		// with backoff instead of dead-lettering. MarkDeadLetter sets status directly.
+		if err := store.MarkDeadLetter(mCtx, p.db, e.ID, http.StatusText(resp.StatusCode)); err != nil {
+			log.Printf("outbox dead-letter (4xx) id=%s: %v", e.ID, err)
+		}
 	default:
-		// 5xx / redirect — schedule retry with backoff.
-		store.MarkFailed(ctx, p.db, e.ID,
-			http.StatusText(resp.StatusCode), maxRetries)
+		// 5xx / redirect — schedule retry with exponential backoff.
+		if err := store.MarkFailed(mCtx, p.db, e.ID, http.StatusText(resp.StatusCode), maxRetries); err != nil {
+			log.Printf("outbox mark failed (5xx) id=%s: %v", e.ID, err)
+		}
 	}
 }
