@@ -6,10 +6,10 @@ Strategy:            select_for_update
 Transfers:           50000
 Workers:             20
 Accounts:            500
-Wall time:           17.675s
-TPS:                 2829
-Latency p50:         6.247ms
-Latency p99:         17.487ms
+Wall time:           17.356s
+TPS:                 2881
+Latency p50:         6.339ms
+Latency p99:         14.879ms
 Transfer errors:     0
 
 === Invariant Check ===

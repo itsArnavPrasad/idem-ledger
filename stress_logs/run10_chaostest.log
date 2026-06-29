@@ -1,10 +1,10 @@
 Seeding 500 outbox events...
-Delivered before crash:    100
+Delivered before crash:    50
 
 === Chaos Test Results ===
 Events queued:             500
-Delivered before crash:    100
-Remaining after restart:   400
+Delivered before crash:    50
+Remaining after restart:   450
 Total delivered (DB):      500
 Dead-lettered:             0
 Unique X-Event-IDs seen:   500

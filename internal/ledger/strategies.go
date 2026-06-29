@@ -2,11 +2,15 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/arnavprasad/idem-ledger/internal/idempotency"
 )
 
 // isRetriableConflict reports whether err is a transient concurrency error that
@@ -76,19 +80,37 @@ func debitSelectForUpdate(ctx context.Context, tx pgx.Tx, fromAccount, amount in
 	return err
 }
 
-// ExecuteWithForUpdate runs a full transfer using Fix B.
+// maxRetries is the retry budget for transient concurrency errors (deadlock 40P01,
+// serialisation failure 40001) shared by all three execution strategies.
+const maxRetries = 5
+
+// ExecuteWithForUpdate runs a full transfer using Fix B with idempotency support.
 // Both account rows are locked in ascending ID order before any balance is read,
 // preventing deadlocks when concurrent transfers run in opposite directions (A→B and B→A).
 // The ascending-order pre-lock makes deadlocks virtually impossible, but a serialisation
 // failure (40001) or transient error is still retried for robustness.
-func ExecuteWithForUpdate(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotencyResult, error) {
-	if req.IdempotencyKey != "" {
-		return Transfer{}, nil, errors.New("idempotency key not supported by ExecuteWithForUpdate; use Execute")
-	}
+func ExecuteWithForUpdate(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotency.StoredResponse, error) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return Transfer{}, nil, err
+		}
+
+		// Idempotency claim — inside the same transaction as the pre-lock and transfer,
+		// so a rollback (deadlock retry) also rolls back the claim.
+		if req.IdempotencyKey != "" {
+			won, stored, err := idempotency.ClaimInTx(ctx, tx, req.IdempotencyKey, req.RequestHash)
+			if err != nil {
+				tx.Rollback(ctx)
+				if isRetriableConflict(err) {
+					continue
+				}
+				return Transfer{}, nil, err
+			}
+			if !won {
+				tx.Rollback(ctx)
+				return Transfer{}, stored, nil
+			}
 		}
 
 		// Lock in ascending id order — canonical deadlock prevention.
@@ -116,6 +138,20 @@ func ExecuteWithForUpdate(ctx context.Context, pool *pgxpool.Pool, req TransferR
 			}
 			return Transfer{}, nil, err
 		}
+
+		// Record idempotency result before committing so it's atomic with the transfer.
+		if req.IdempotencyKey != "" {
+			body, err := json.Marshal(result)
+			if err != nil {
+				tx.Rollback(ctx)
+				return Transfer{}, nil, fmt.Errorf("marshal transfer result: %w", err)
+			}
+			if err := idempotency.Complete(ctx, tx, req.IdempotencyKey, 201, body); err != nil {
+				tx.Rollback(ctx)
+				return Transfer{}, nil, err
+			}
+		}
+
 		if err := tx.Commit(ctx); err != nil {
 			tx.Rollback(ctx)
 			if isRetriableConflict(err) {
@@ -128,21 +164,20 @@ func ExecuteWithForUpdate(ctx context.Context, pool *pgxpool.Pool, req TransferR
 	return Transfer{}, nil, errors.New("too many retries in ExecuteWithForUpdate")
 }
 
-// maxRetries is the retry budget for transient concurrency errors (deadlock 40P01,
-// serialisation failure 40001) shared by all three execution strategies.
-const maxRetries = 5
-
 // --- Fix C: optimistic concurrency (version column) ---
 // Reads (balance, version), checks, then updates only if version unchanged.
 // Retries up to maxRetries times before giving up.
-func ExecuteOptimistic(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotencyResult, error) {
+// Note: idempotency keys are not supported by this strategy — the multi-transaction
+// retry loop is fundamentally incompatible with single-transaction idempotency claims.
+// Use Execute (Fix A) or ExecuteWithForUpdate (Fix B) when idempotency is required.
+func ExecuteOptimistic(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, error) {
 	if req.IdempotencyKey != "" {
-		return Transfer{}, nil, errors.New("idempotency key not supported by ExecuteOptimistic; use Execute")
+		return Transfer{}, errors.New("idempotency key not supported by ExecuteOptimistic; use Execute or ExecuteWithForUpdate")
 	}
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
-			return Transfer{}, nil, err
+			return Transfer{}, err
 		}
 
 		var balance, version int64
@@ -152,15 +187,15 @@ func ExecuteOptimistic(ctx context.Context, pool *pgxpool.Pool, req TransferRequ
 		).Scan(&balance, &version)
 		if errors.Is(err, pgx.ErrNoRows) {
 			tx.Rollback(ctx)
-			return Transfer{}, nil, ErrAccountNotFound
+			return Transfer{}, ErrAccountNotFound
 		}
 		if err != nil {
 			tx.Rollback(ctx)
-			return Transfer{}, nil, err
+			return Transfer{}, err
 		}
 		if balance < req.Amount {
 			tx.Rollback(ctx)
-			return Transfer{}, nil, ErrInsufficientFunds
+			return Transfer{}, ErrInsufficientFunds
 		}
 
 		tag, err := tx.Exec(ctx,
@@ -173,7 +208,7 @@ func ExecuteOptimistic(ctx context.Context, pool *pgxpool.Pool, req TransferRequ
 			if isRetriableConflict(err) {
 				continue
 			}
-			return Transfer{}, nil, err
+			return Transfer{}, err
 		}
 		if tag.RowsAffected() == 0 {
 			// Version changed — someone else updated first. Retry.
@@ -184,33 +219,37 @@ func ExecuteOptimistic(ctx context.Context, pool *pgxpool.Pool, req TransferRequ
 		// Credit destination (no version check needed on the credit side).
 		// A deadlock here means another goroutine holds the to_account row lock and is waiting
 		// for from_account — exactly the A→B / B→A cycle. Roll back and retry.
-		if _, err := tx.Exec(ctx,
+		creditTag, err := tx.Exec(ctx,
 			`UPDATE accounts SET balance = balance + $1 WHERE id = $2`,
 			req.Amount, req.ToAccount,
-		); err != nil {
+		)
+		if err != nil {
 			tx.Rollback(ctx)
 			if isRetriableConflict(err) {
 				continue
 			}
-			return Transfer{}, nil, err
+			return Transfer{}, err
+		}
+		if creditTag.RowsAffected() == 0 {
+			tx.Rollback(ctx)
+			return Transfer{}, ErrAccountNotFound
 		}
 
 		result, err := insertTransferAndPostings(ctx, tx, req)
 		if err != nil {
 			tx.Rollback(ctx)
-			return Transfer{}, nil, err
+			return Transfer{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
-			// Commit failed (serialisation conflict or transient error) — roll back and retry.
-			// Without this Rollback the pgx connection is returned to the pool in an aborted
-			// transaction state, causing "current transaction is aborted" errors for unrelated callers.
+			// Only retry on transient concurrency errors. A permanent error (disk full,
+			// constraint violation) should not be retried 5 times before surfacing.
 			tx.Rollback(ctx)
-			continue
+			if isRetriableConflict(err) {
+				continue
+			}
+			return Transfer{}, err
 		}
-		return result, nil, nil
+		return result, nil
 	}
-	return Transfer{}, nil, errors.New("too many optimistic retry conflicts")
+	return Transfer{}, errors.New("too many optimistic retry conflicts")
 }
-
-// idempotencyResult is used in the strategy helpers (unused until Phase 8 harness wires it up).
-type idempotencyResult = struct{}

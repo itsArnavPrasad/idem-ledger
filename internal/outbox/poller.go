@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/arnavprasad/idem-ledger/internal/store"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -119,14 +120,12 @@ func (p *Poller) deliver(ctx context.Context, e store.OutboxEvent) {
 	defer cancel()
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		if err := store.MarkDelivered(mCtx, p.db, e.ID); err != nil {
-			log.Printf("outbox mark delivered id=%s: %v", e.ID, err)
-		}
+		// Retry MarkDelivered up to 3 times to shrink the duplicate delivery window.
+		// If all retries fail, the row stays in_flight and will be redelivered after
+		// the stale-recovery threshold (~30s) — inherent at-least-once semantics.
+		p.markDeliveredWithRetry(e.ID)
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		// Client error (404, 410, etc.) — retrying cannot help, dead-letter immediately.
-		// Bug fix: the old code used MarkFailed(maxRetries+1) which evaluated
-		// attempt_count+1 >= maxRetries+1 = false for a fresh event, so it retried
-		// with backoff instead of dead-lettering. MarkDeadLetter sets status directly.
 		if err := store.MarkDeadLetter(mCtx, p.db, e.ID, http.StatusText(resp.StatusCode)); err != nil {
 			log.Printf("outbox dead-letter (4xx) id=%s: %v", e.ID, err)
 		}
@@ -136,4 +135,24 @@ func (p *Poller) deliver(ctx context.Context, e store.OutboxEvent) {
 			log.Printf("outbox mark failed (5xx) id=%s: %v", e.ID, err)
 		}
 	}
+}
+
+// markDeliveredWithRetry retries MarkDelivered up to 3 times (1s apart).
+// The duplicate delivery window shrinks to the gap between the HTTP 200 response
+// and the third DB write attempt — typically well under 3 seconds. Events that
+// still fail after 3 attempts are left in_flight and redelivered after 30s
+// (stale-recovery), which is correct at-least-once behavior.
+func (p *Poller) markDeliveredWithRetry(id uuid.UUID) {
+	for i := 0; i < 3; i++ {
+		mCtx, cancel := markCtx()
+		err := store.MarkDelivered(mCtx, p.db, id)
+		cancel()
+		if err == nil {
+			return
+		}
+		if i < 2 {
+			time.Sleep(time.Second)
+		}
+	}
+	log.Printf("outbox mark delivered failed after 3 attempts id=%s — will redeliver after stale timeout", id)
 }

@@ -6,10 +6,10 @@ Strategy:            optimistic
 Transfers:           50000
 Workers:             20
 Accounts:            500
-Wall time:           16.331s
-TPS:                 3062
-Latency p50:         5.619ms
-Latency p99:         15.015ms
+Wall time:           15.161s
+TPS:                 3298
+Latency p50:         5.423ms
+Latency p99:         14.831ms
 Transfer errors:     0
 
 === Invariant Check ===

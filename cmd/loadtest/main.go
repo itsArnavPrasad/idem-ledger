@@ -136,7 +136,7 @@ func runTransfers(ctx context.Context, pool *pgxpool.Pool, ids []int64, total, w
 				case "select_for_update":
 					_, _, err = ledger.ExecuteWithForUpdate(ctx, pool, req)
 				case "optimistic":
-					_, _, err = ledger.ExecuteOptimistic(ctx, pool, req)
+					_, err = ledger.ExecuteOptimistic(ctx, pool, req)
 				default:
 					_, _, err = ledger.Execute(ctx, pool, req)
 				}

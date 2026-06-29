@@ -1,0 +1,2 @@
+ALTER TABLE idempotency_keys DROP CONSTRAINT idempotency_keys_done_has_response_code;
+ALTER TABLE idempotency_keys DROP COLUMN claimed_at;

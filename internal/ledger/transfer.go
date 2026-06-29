@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,10 @@ import (
 var (
 	ErrInsufficientFunds = errors.New("insufficient funds")
 	ErrAccountNotFound   = errors.New("account not found")
+	ErrCurrencyMismatch  = errors.New("currency mismatch: from_account, to_account, and transfer currency must all match")
+	ErrInvalidAmount     = errors.New("amount must be positive")
+	ErrSameAccount       = errors.New("from_account and to_account must differ")
+	ErrInvalidCurrency   = errors.New("currency must be a 3-letter ISO 4217 code")
 )
 
 type TransferRequest struct {
@@ -48,11 +53,23 @@ type Transfer struct {
 const maxDeadlockRetries = 5
 
 // Execute runs a transfer as a single atomic DB transaction.
+// Validates the request before touching the database; callers that bypass the HTTP
+// layer get clean domain errors instead of raw DB constraint failures.
 // When IdempotencyKey is set, it claims the key, does the work, and records the
 // response — all inside one transaction. Replays return the stored response.
 // Deadlocks (40P01) and serialisation failures (40001) are retried automatically;
 // these arise when two concurrent A→B and B→A transfers race on the same rows.
 func Execute(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotency.StoredResponse, error) {
+	if req.Amount <= 0 {
+		return Transfer{}, nil, ErrInvalidAmount
+	}
+	if req.FromAccount == req.ToAccount {
+		return Transfer{}, nil, ErrSameAccount
+	}
+	if len(req.Currency) != 3 {
+		return Transfer{}, nil, ErrInvalidCurrency
+	}
+
 	for attempt := 0; attempt < maxDeadlockRetries; attempt++ {
 		t, stored, err := executeOnce(ctx, pool, req)
 		if err != nil && isRetriableConflict(err) {
@@ -91,7 +108,10 @@ func executeOnce(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (
 
 	// Record the idempotent result before committing so it's atomic.
 	if req.IdempotencyKey != "" {
-		body, _ := json.Marshal(result)
+		body, err := json.Marshal(result)
+		if err != nil {
+			return Transfer{}, nil, fmt.Errorf("marshal transfer result: %w", err)
+		}
 		if err := idempotency.Complete(ctx, tx, req.IdempotencyKey, 201, body); err != nil {
 			return Transfer{}, nil, err
 		}
@@ -110,7 +130,29 @@ func execTx(ctx context.Context, tx pgx.Tx, req TransferRequest) (Transfer, erro
 
 // execTxWithDebit runs the transfer using the provided debit strategy.
 // Called by Fix A (execTx), Fix B (ExecuteWithForUpdate), and Fix C (ExecuteOptimistic).
+// Validates that both accounts exist and share the same currency as the transfer
+// before any balance mutation, so the caller gets a clean domain error.
 func execTxWithDebit(ctx context.Context, tx pgx.Tx, req TransferRequest, debit debitFn) (Transfer, error) {
+	// Validate that both accounts exist and their currencies match the transfer currency.
+	// Done in one query to avoid two round trips. ErrNoRows means at least one account
+	// is missing; we return ErrAccountNotFound in that case.
+	var fromCurr, toCurr string
+	err := tx.QueryRow(ctx,
+		`SELECT a1.currency, a2.currency
+		 FROM accounts a1, accounts a2
+		 WHERE a1.id = $1 AND a2.id = $2`,
+		req.FromAccount, req.ToAccount,
+	).Scan(&fromCurr, &toCurr)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Transfer{}, ErrAccountNotFound
+	}
+	if err != nil {
+		return Transfer{}, err
+	}
+	if fromCurr != req.Currency || toCurr != req.Currency {
+		return Transfer{}, ErrCurrencyMismatch
+	}
+
 	if err := debit(ctx, tx, req.FromAccount, req.Amount); err != nil {
 		return Transfer{}, err
 	}
@@ -168,7 +210,10 @@ func insertTransferAndPostings(ctx context.Context, tx pgx.Tx, req TransferReque
 	if err != nil {
 		return Transfer{}, err
 	}
-	payload, _ := json.Marshal(t)
+	payload, err := json.Marshal(t)
+	if err != nil {
+		return Transfer{}, fmt.Errorf("marshal outbox payload: %w", err)
+	}
 	if err := store.InsertOutboxEventInTx(ctx, tx, "transfer.created", payload, webhookURL); err != nil {
 		return Transfer{}, err
 	}

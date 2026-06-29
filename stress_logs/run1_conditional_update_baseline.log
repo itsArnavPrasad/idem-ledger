@@ -6,10 +6,10 @@ Strategy:            conditional_update
 Transfers:           50000
 Workers:             20
 Accounts:            500
-Wall time:           13.985s
-TPS:                 3575
-Latency p50:         4.843ms
-Latency p99:         10.655ms
+Wall time:           15.014s
+TPS:                 3330
+Latency p50:         5.335ms
+Latency p99:         15.487ms
 Transfer errors:     0
 
 === Invariant Check ===
