@@ -9,7 +9,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
@@ -29,63 +28,6 @@ type StoredResponse struct {
 func HashRequest(body []byte) string {
 	sum := sha256.Sum256(body)
 	return fmt.Sprintf("%x", sum)
-}
-
-// Claim attempts to insert an in_progress record for key.
-// Returns (true, nil) if this request wins — caller must call Complete after work is done.
-// Returns (false, stored, nil) if key already exists with same hash and status=done — replay stored.
-// Returns error on: hash mismatch (ErrDuplicateRequest), in_progress race (ErrInProgress), or DB error.
-func Claim(ctx context.Context, db *pgxpool.Pool, key, requestHash string) (won bool, stored *StoredResponse, err error) {
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return false, nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO idempotency_keys (key, request_hash, status)
-		 VALUES ($1, $2, 'in_progress')
-		 ON CONFLICT (key) DO NOTHING`,
-		key, requestHash,
-	)
-	if err != nil {
-		return false, nil, err
-	}
-
-	if tag.RowsAffected() == 1 {
-		// We inserted the row — we won the race. Commit the insertion and proceed.
-		if err := tx.Commit(ctx); err != nil {
-			return false, nil, err
-		}
-		return true, nil, nil
-	}
-
-	// Row already existed. Read it to determine what to do.
-	var existingHash, status string
-	var respCode *int
-	var respBody []byte
-	err = tx.QueryRow(ctx,
-		`SELECT request_hash, status, response_code, response_body FROM idempotency_keys WHERE key = $1`,
-		key,
-	).Scan(&existingHash, &status, &respCode, &respBody)
-	if err != nil {
-		return false, nil, err
-	}
-
-	if existingHash != requestHash {
-		// Same key, different body — client is misusing the key.
-		return false, nil, ErrDuplicateRequest
-	}
-
-	if status == "in_progress" {
-		return false, nil, ErrInProgress
-	}
-
-	// status == "done" — replay the stored response.
-	if err := tx.Commit(ctx); err != nil {
-		return false, nil, err
-	}
-	return false, &StoredResponse{Code: *respCode, Body: json.RawMessage(respBody)}, nil
 }
 
 // Complete marks the key as done and stores the response, inside a provided transaction.

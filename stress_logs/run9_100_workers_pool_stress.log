@@ -1,0 +1,20 @@
+Seeding 500 accounts...
+Running 50000 transfers (100 workers, strategy=conditional_update)...
+
+=== Results ===
+Strategy:            conditional_update
+Transfers:           50000
+Workers:             100
+Accounts:            500
+Wall time:           12.672s
+TPS:                 3946
+Latency p50:         23.039ms
+Latency p99:         34.911ms
+Transfer errors:     0
+
+=== Invariant Check ===
+Conservation (SUM postings):   0  (want 0)
+Balance drift accounts:         0  (want 0)
+Negative balances:              0  (want 0)
+
+Invariant violations: 0 ✓

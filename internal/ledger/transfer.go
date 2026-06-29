@@ -40,10 +40,30 @@ type Transfer struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// maxDeadlockRetries is the retry budget for deadlock (40P01) and serialisation
+// failure (40001) errors in Execute. Both are transient: PostgreSQL rolls back one
+// side of the deadlock and the transaction can be retried safely. The idempotency
+// key claim is inside the same transaction, so a rollback also unwinds the claim —
+// retrying re-claims it from scratch, keeping atomicity intact.
+const maxDeadlockRetries = 5
+
 // Execute runs a transfer as a single atomic DB transaction.
 // When IdempotencyKey is set, it claims the key, does the work, and records the
 // response — all inside one transaction. Replays return the stored response.
+// Deadlocks (40P01) and serialisation failures (40001) are retried automatically;
+// these arise when two concurrent A→B and B→A transfers race on the same rows.
 func Execute(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotency.StoredResponse, error) {
+	for attempt := 0; attempt < maxDeadlockRetries; attempt++ {
+		t, stored, err := executeOnce(ctx, pool, req)
+		if err != nil && isRetriableConflict(err) {
+			continue
+		}
+		return t, stored, err
+	}
+	return Transfer{}, nil, errors.New("too many deadlock retries on transfer")
+}
+
+func executeOnce(ctx context.Context, pool *pgxpool.Pool, req TransferRequest) (Transfer, *idempotency.StoredResponse, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return Transfer{}, nil, err
